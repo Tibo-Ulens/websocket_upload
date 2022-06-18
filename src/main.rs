@@ -32,8 +32,6 @@ fn send_message_chunk(id: usize, msg_chunk: Vec<Message>, url: &Url, repeat: boo
 		// TODO: try to not reallocate this every loop
 		let futures = FuturesUnordered::new();
 
-		println!("sending chunk {id} ({} futures)...", futures.len());
-
 		for msg in &msg_chunk {
 			let tx = Arc::clone(&tx);
 
@@ -48,6 +46,8 @@ fn send_message_chunk(id: usize, msg_chunk: Vec<Message>, url: &Url, repeat: boo
 
 			futures.push(handle);
 		}
+
+		println!("sending chunk {id} ({} futures)...", futures.len());
 
 		let handle = runtime.spawn(async {
 			join_all(futures).await;
