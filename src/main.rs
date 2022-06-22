@@ -22,7 +22,7 @@ use url::Url;
 
 /// Open a websocket and send a chunk of messages
 #[inline(always)]
-fn _send_message_chunk(id: usize, msg_chunk: Vec<Message>, url: &Url, repeat: bool) {
+fn send_chunk_ws(id: usize, msg_chunk: Vec<Message>, url: &Url, repeat: bool) {
 	let runtime = Runtime::new().unwrap();
 
 	let tx_raw = runtime.block_on(async move {
@@ -75,7 +75,7 @@ fn _send_message_chunk(id: usize, msg_chunk: Vec<Message>, url: &Url, repeat: bo
 
 /// Open a UDP socket and send a chunk of messages
 #[inline(always)]
-fn send_message_chunk(id: usize, msg_chunk: Vec<Bytes>, url: &SocketAddr, repeat: bool) {
+fn send_chunk_udp(id: usize, msg_chunk: Vec<Bytes>, url: &SocketAddr, repeat: bool) {
 	let runtime = Runtime::new().unwrap();
 
 	let socket = runtime.block_on(async move {
@@ -130,16 +130,15 @@ fn send_message_chunk(id: usize, msg_chunk: Vec<Bytes>, url: &SocketAddr, repeat
 	}
 }
 
-/// Pregenerate the websocket messages
-fn generate_ws_messages(img_file: &str, alpha: Option<&u8>) -> Result<Vec<Bytes>, Error> {
+/// Pregenerate the UDP packet data
+fn generate_udp_bytes(img_file: &str, alpha: Option<&u8>) -> Result<Vec<Bytes>, Error> {
 	let img_reader = Reader::open(img_file)?;
 	let img = img_reader.decode()?;
 
-	let mut messages: Vec<Bytes> =
-		Vec::with_capacity(img.width() as usize * img.height() as usize);
-
 	let w = img.width();
 	let h = img.height();
+
+	let mut messages: Vec<Bytes> = Vec::with_capacity(w as usize * h as usize);
 
 	for x in 0..w {
 		for y in 0..h {
@@ -172,45 +171,49 @@ fn generate_ws_messages(img_file: &str, alpha: Option<&u8>) -> Result<Vec<Bytes>
 	Ok(messages)
 }
 
-fn main() {
-	let matches = Command::new(env!("CARGO_PKG_NAME"))
-		.version(env!("CARGO_PKG_VERSION"))
-		.author(env!("CARGO_PKG_AUTHORS"))
-		.about(env!("CARGO_PKG_DESCRIPTION"))
-		.arg_required_else_help(true)
-		.arg(
-			Arg::new("repeat")
-				.short('r')
-				.long("repeat")
-				.help("Whether or not to keep uploading the image (battle mode)")
-				.action(ArgAction::SetTrue),
-		)
-		.arg(
-			Arg::new("shuffle")
-				.short('s')
-				.long("shuffle")
-				.help("Whether or not to randomly shuffle the images content before uploading")
-				.action(ArgAction::SetTrue),
-		)
-		.arg(Arg::new("alpha")
-			.short('a')
-			.long("alpha")
-			.takes_value(true)
-			.number_of_values(1)
-			.value_parser(clap::value_parser!(u8))
-		)
-		.arg(Arg::new("ws_url").help("The UDP URL to connect to").index(1).required(true))
-		.arg(Arg::new("img_file").help("The path of the image to upload").index(2).required(true))
-		.get_matches();
+/// Pregenerate the websocket messages
+fn generate_ws_messages(img_file: &str, alpha: Option<&u8>) -> Result<Vec<Message>, Error> {
+	let img_reader = Reader::open(img_file)?;
+	let img = img_reader.decode()?;
 
-	// Unwrap is safe as args are guaranteed to exist
-	let ws_url_raw = matches.get_one::<String>("ws_url").unwrap();
-	let img_file = matches.get_one::<String>("img_file").unwrap();
-	let alpha = matches.get_one::<u8>("alpha");
-	let repeat = *matches.get_one::<bool>("repeat").unwrap();
-	let shuffle = *matches.get_one::<bool>("shuffle").unwrap();
+	let w = img.width();
+	let h = img.height();
 
-	let ws_url = match ws_url_raw.parse::<SocketAddr>() {
+	let mut messages: Vec<Message> = Vec::with_capacity(w as usize * h as usize);
+
+	for x in 0..w {
+		for y in 0..h {
+			let pixel = img.get_pixel(x, y).0;
+
+			let x_bytes: [u8; 4] = unsafe { transmute(x.to_be()) };
+			let y_bytes: [u8; 4] = unsafe { transmute(y.to_be()) };
+
+			let bytes = vec![
+				x_bytes[0],
+				x_bytes[1],
+				x_bytes[2],
+				x_bytes[3],
+				y_bytes[0],
+				y_bytes[1],
+				y_bytes[2],
+				y_bytes[3],
+				pixel[0],
+				pixel[1],
+				pixel[2],
+				*alpha.unwrap_or_else(|| &pixel[3]),
+			];
+
+			messages.push(Message::Binary(bytes))
+		}
+	}
+
+	messages.truncate(messages.len());
+
+	Ok(messages)
+}
+
+fn send_ws(ws_url_raw: &str, img_file: &str, alpha: Option<&u8>, shuffle: bool, repeat: bool) {
+	let ws_url = match ws_url_raw.parse::<Url>() {
 		Ok(u) => u,
 		Err(e) => {
 			eprintln!("{:?}", e);
@@ -218,7 +221,7 @@ fn main() {
 		},
 	};
 
-	println!("creating websocket message array...");
+	println!("creating WebSocket message array...");
 
 	let mut messages = match generate_ws_messages(img_file, alpha) {
 		Ok(m) => m,
@@ -248,12 +251,135 @@ fn main() {
 		let url = ws_url.clone();
 		let chunk = chunk.to_vec();
 
-		let handle = thread::spawn(move || send_message_chunk(id, chunk, &url, repeat));
+		let handle = thread::spawn(move || send_chunk_ws(id, chunk, &url, repeat));
 
 		handles.push(handle);
 	}
 
 	for handle in handles {
 		handle.join().unwrap();
+	}
+}
+
+fn send_udp(udp_url_raw: &str, img_file: &str, alpha: Option<&u8>, shuffle: bool, repeat: bool) {
+	let udp_url = match udp_url_raw.parse::<SocketAddr>() {
+		Ok(u) => u,
+		Err(e) => {
+			eprintln!("{:?}", e);
+			process::exit(1);
+		},
+	};
+
+
+	println!("creating UDP message array...");
+
+	let mut messages = match generate_udp_bytes(img_file, alpha) {
+		Ok(m) => m,
+		Err(e) => {
+			eprintln!("{:?}", e);
+			process::exit(1);
+		},
+	};
+
+	if shuffle {
+		println!("shuffling messages...");
+		messages.shuffle(&mut thread_rng());
+	}
+
+	println!("generated {} messages", messages.len());
+
+	let num_cpus = num_cpus::get();
+	let chunk_size = messages.len() / num_cpus;
+
+	println!("starting with {num_cpus} threads...");
+
+	let mut handles = vec![];
+
+	for (id, chunk) in messages.chunks(chunk_size).enumerate() {
+		// Fucking borrow checker doesn't realise that these threads *don't* actually need
+		// 'static lifetimes so i have clone this smhsmhsmhsmhsmh
+		let url = udp_url;
+		let chunk = chunk.to_vec();
+
+		let handle = thread::spawn(move || send_chunk_udp(id, chunk, &url, repeat));
+
+		handles.push(handle);
+	}
+
+	for handle in handles {
+		handle.join().unwrap();
+	}
+}
+
+fn main() {
+	let matches = Command::new(env!("CARGO_PKG_NAME"))
+		.version(env!("CARGO_PKG_VERSION"))
+		.author(env!("CARGO_PKG_AUTHORS"))
+		.about(env!("CARGO_PKG_DESCRIPTION"))
+		.arg_required_else_help(true)
+		.arg(
+			Arg::new("repeat")
+				.short('r')
+				.long("repeat")
+				.help("Whether or not to keep uploading the image (battle mode)")
+				.action(ArgAction::SetTrue),
+		)
+		.arg(
+			Arg::new("shuffle")
+				.short('s')
+				.long("shuffle")
+				.help("Whether or not to randomly shuffle the images content before uploading")
+				.action(ArgAction::SetTrue),
+		)
+		.arg(
+			Arg::new("alpha")
+				.short('a')
+				.long("alpha")
+				.help("An optional alpha value for each pixel")
+				.takes_value(true)
+				.number_of_values(1)
+				.value_parser(clap::value_parser!(u8)),
+		)
+		.arg(
+			Arg::new("ws_url")
+				.short('w')
+				.long("ws")
+				.help("The WebSocket URL to connect to")
+				.conflicts_with("udp_url")
+				.takes_value(true)
+				.number_of_values(1)
+				.value_parser(clap::value_parser!(String))
+				.required_unless_present("udp_url"),
+		)
+		.arg(
+			Arg::new("udp_url")
+				.short('w')
+				.long("udp")
+				.help("The UDP URL to connect to")
+				.conflicts_with("ws_url")
+				.takes_value(true)
+				.number_of_values(1)
+				.value_parser(clap::value_parser!(String))
+				.required_unless_present("ws_url"),
+		)
+		.arg(Arg::new("img_file").help("The path of the image to upload").index(1).required(true))
+		.get_matches();
+
+	// Unwrap is safe as args are guaranteed to exist
+	let ws_url_raw = matches.get_one::<String>("ws_url");
+	let udp_url_raw = matches.get_one::<String>("udp_url");
+
+	let img_file = matches.get_one::<String>("img_file").unwrap();
+	let alpha = matches.get_one::<u8>("alpha");
+
+	let repeat = *matches.get_one::<bool>("repeat").unwrap();
+	let shuffle = *matches.get_one::<bool>("shuffle").unwrap();
+
+	let is_ws = udp_url_raw.is_none();
+
+	if is_ws {
+		send_ws(ws_url_raw.unwrap(), img_file, alpha, shuffle, repeat)
+	} else {
+		send_udp(udp_url_raw.unwrap(), img_file, alpha, shuffle, repeat)
 	}
 }
