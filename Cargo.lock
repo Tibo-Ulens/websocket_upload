@@ -471,6 +471,7 @@ name = "kelderscherm_upload"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "futures-util",
  "image",
