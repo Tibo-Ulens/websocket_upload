@@ -1,3 +1,4 @@
+use std::intrinsics::transmute;
 use std::sync::Arc;
 use std::{process, thread};
 
@@ -70,7 +71,7 @@ fn send_message_chunk(id: usize, msg_chunk: Vec<Message>, url: &Url, repeat: boo
 }
 
 /// Pregenerate the websocket messages
-fn generate_ws_messages(img_file: &str) -> Result<Vec<Message>, Error> {
+fn generate_ws_messages(img_file: &str, alpha: Option<&u8>) -> Result<Vec<Message>, Error> {
 	let img_reader = Reader::open(img_file)?;
 	let img = img_reader.decode()?;
 
@@ -84,10 +85,25 @@ fn generate_ws_messages(img_file: &str) -> Result<Vec<Message>, Error> {
 		for y in 0..h {
 			let pixel = img.get_pixel(x, y).0;
 
-			messages.push(Message::Text(format!(
-				"{} {} {} {} {} {}",
-				x, y, pixel[0], pixel[1], pixel[2], pixel[3]
-			)));
+			let x_bytes: [u8; 4] = unsafe { transmute(x.to_be()) };
+			let y_bytes: [u8; 4] = unsafe { transmute(y.to_be()) };
+
+			messages.push(Message::Binary(
+				vec![
+					x_bytes[0],
+					x_bytes[1],
+					x_bytes[2],
+					x_bytes[3],
+					y_bytes[0],
+					y_bytes[1],
+					y_bytes[2],
+					y_bytes[3],
+					pixel[0],
+					pixel[1],
+					pixel[2],
+					*alpha.unwrap_or_else(|| &pixel[3])
+				]
+			))
 		}
 	}
 
@@ -116,6 +132,13 @@ fn main() {
 				.help("Whether or not to randomly shuffle the images content before uploading")
 				.action(ArgAction::SetTrue),
 		)
+		.arg(Arg::new("alpha")
+			.short('a')
+			.long("alpha")
+			.takes_value(true)
+			.number_of_values(1)
+			.value_parser(clap::value_parser!(u8))
+		)
 		.arg(Arg::new("ws_url").help("The websocket URL to connect to").index(1).required(true))
 		.arg(Arg::new("img_file").help("The path of the image to upload").index(2).required(true))
 		.get_matches();
@@ -123,6 +146,7 @@ fn main() {
 	// Unwrap is safe as args are guaranteed to exist
 	let ws_url_raw = matches.get_one::<String>("ws_url").unwrap();
 	let img_file = matches.get_one::<String>("img_file").unwrap();
+	let alpha = matches.get_one::<u8>("alpha");
 	let repeat = *matches.get_one::<bool>("repeat").unwrap();
 	let shuffle = *matches.get_one::<bool>("shuffle").unwrap();
 
@@ -136,7 +160,7 @@ fn main() {
 
 	println!("creating websocket message array...");
 
-	let mut messages = match generate_ws_messages(img_file) {
+	let mut messages = match generate_ws_messages(img_file, alpha) {
 		Ok(m) => m,
 		Err(e) => {
 			eprintln!("{:?}", e);
