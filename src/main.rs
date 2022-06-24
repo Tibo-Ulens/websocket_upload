@@ -1,4 +1,3 @@
-use std::intrinsics::transmute;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{process, thread};
@@ -97,13 +96,7 @@ fn send_chunk_udp(id: usize, msg_chunk: Vec<Bytes>, url: &SocketAddr, repeat: bo
 			// TODO: break the laws of thermodynamics and try to remove this copy
 			let msg = msg.to_owned();
 
-			let handle = runtime.spawn(async move {
-				// let mut sender = tx.lock().await;
-
-				// sender.feed(msg).await
-
-				tx.send(&msg).await
-			});
+			let handle = runtime.spawn(async move { tx.send(&msg).await });
 
 			futures.push(handle);
 		}
@@ -144,8 +137,8 @@ fn generate_udp_bytes(img_file: &str, alpha: Option<&u8>) -> Result<Vec<Bytes>, 
 		for y in 0..h {
 			let pixel = img.get_pixel(x, y).0;
 
-			let x_bytes: [u8; 4] = unsafe { transmute(x.to_be()) };
-			let y_bytes: [u8; 4] = unsafe { transmute(y.to_be()) };
+			let x_bytes: [u8; 4] = x.to_be().to_ne_bytes();
+			let y_bytes: [u8; 4] = y.to_be().to_ne_bytes();
 
 			let bytes = vec![
 				x_bytes[0],
@@ -185,8 +178,8 @@ fn generate_ws_messages(img_file: &str, alpha: Option<&u8>) -> Result<Vec<Messag
 		for y in 0..h {
 			let pixel = img.get_pixel(x, y).0;
 
-			let x_bytes: [u8; 4] = unsafe { transmute(x.to_be()) };
-			let y_bytes: [u8; 4] = unsafe { transmute(y.to_be()) };
+			let x_bytes: [u8; 4] = x.to_be().to_ne_bytes();
+			let y_bytes: [u8; 4] = y.to_be().to_ne_bytes();
 
 			let bytes = vec![
 				x_bytes[0],
