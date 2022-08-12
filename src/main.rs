@@ -1,9 +1,7 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{process, thread};
 
 use anyhow::Error;
-use bytes::Bytes;
 use clap::{Arg, ArgAction, Command};
 use futures_util::future::join_all;
 use futures_util::lock::Mutex;
@@ -13,7 +11,6 @@ use image::io::Reader;
 use image::GenericImageView;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use tokio::net::UdpSocket;
 use tokio::runtime::Runtime;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -70,98 +67,6 @@ fn send_chunk_ws(id: usize, msg_chunk: Vec<Message>, url: &Url, repeat: bool) {
 			break;
 		}
 	}
-}
-
-/// Open a UDP socket and send a chunk of messages
-#[inline(always)]
-fn send_chunk_udp(id: usize, msg_chunk: Vec<Bytes>, url: &SocketAddr, repeat: bool) {
-	let runtime = Runtime::new().unwrap();
-
-	let socket = runtime.block_on(async move {
-		let socket = UdpSocket::bind("0.0.0.0:0").await.expect("UDP failed to bind");
-		socket.connect(url).await.expect("UDP failed to connect");
-
-		socket
-	});
-
-	let tx = Arc::new(socket);
-
-	loop {
-		// TODO: try to not reallocate this every loop
-		let futures = FuturesUnordered::new();
-
-		for msg in &msg_chunk {
-			let tx = Arc::clone(&tx);
-
-			// TODO: break the laws of thermodynamics and try to remove this copy
-			let msg = msg.to_owned();
-
-			let handle = runtime.spawn(async move { tx.send(&msg).await });
-
-			futures.push(handle);
-		}
-
-		println!("sending chunk {id} ({} futures)...", futures.len());
-
-		let handle = runtime.spawn(async {
-			join_all(futures).await;
-		});
-
-		// let tx = Arc::clone(&tx);
-		runtime.block_on(async move {
-			println!("flushing chunk {id}...");
-
-			handle.await.unwrap();
-
-			// let mut sender = tx.lock().await;
-			// sender.flush().await.unwrap();
-		});
-
-		if !(repeat) {
-			break;
-		}
-	}
-}
-
-/// Pregenerate the UDP packet data
-fn generate_udp_bytes(img_file: &str, alpha: Option<&u8>) -> Result<Vec<Bytes>, Error> {
-	let img_reader = Reader::open(img_file)?;
-	let img = img_reader.decode()?;
-
-	let w = img.width();
-	let h = img.height();
-
-	let mut messages: Vec<Bytes> = Vec::with_capacity(w as usize * h as usize);
-
-	for x in 0..w {
-		for y in 0..h {
-			let pixel = img.get_pixel(x, y).0;
-
-			let x_bytes: [u8; 4] = x.to_be().to_ne_bytes();
-			let y_bytes: [u8; 4] = y.to_be().to_ne_bytes();
-
-			let bytes = vec![
-				x_bytes[0],
-				x_bytes[1],
-				x_bytes[2],
-				x_bytes[3],
-				y_bytes[0],
-				y_bytes[1],
-				y_bytes[2],
-				y_bytes[3],
-				pixel[0],
-				pixel[1],
-				pixel[2],
-				*alpha.unwrap_or_else(|| &pixel[3]),
-			];
-
-			messages.push(Bytes::copy_from_slice(&bytes))
-		}
-	}
-
-	messages.truncate(messages.len());
-
-	Ok(messages)
 }
 
 /// Pregenerate the websocket messages
@@ -253,57 +158,6 @@ fn send_ws(ws_url_raw: &str, img_file: &str, alpha: Option<&u8>, shuffle: bool, 
 		handle.join().unwrap();
 	}
 }
-
-fn send_udp(udp_url_raw: &str, img_file: &str, alpha: Option<&u8>, shuffle: bool, repeat: bool) {
-	let udp_url = match udp_url_raw.parse::<SocketAddr>() {
-		Ok(u) => u,
-		Err(e) => {
-			eprintln!("{:?}", e);
-			process::exit(1);
-		},
-	};
-
-
-	println!("creating UDP message array...");
-
-	let mut messages = match generate_udp_bytes(img_file, alpha) {
-		Ok(m) => m,
-		Err(e) => {
-			eprintln!("{:?}", e);
-			process::exit(1);
-		},
-	};
-
-	if shuffle {
-		println!("shuffling messages...");
-		messages.shuffle(&mut thread_rng());
-	}
-
-	println!("generated {} messages", messages.len());
-
-	let num_cpus = num_cpus::get();
-	let chunk_size = messages.len() / num_cpus;
-
-	println!("starting with {num_cpus} threads...");
-
-	let mut handles = vec![];
-
-	for (id, chunk) in messages.chunks(chunk_size).enumerate() {
-		// Fucking borrow checker doesn't realise that these threads *don't* actually need
-		// 'static lifetimes so i have clone this smhsmhsmhsmhsmh
-		let url = udp_url;
-		let chunk = chunk.to_vec();
-
-		let handle = thread::spawn(move || send_chunk_udp(id, chunk, &url, repeat));
-
-		handles.push(handle);
-	}
-
-	for handle in handles {
-		handle.join().unwrap();
-	}
-}
-
 fn main() {
 	let matches = Command::new(env!("CARGO_PKG_NAME"))
 		.version(env!("CARGO_PKG_VERSION"))
@@ -338,29 +192,16 @@ fn main() {
 				.short('w')
 				.long("ws")
 				.help("The WebSocket URL to connect to")
-				.conflicts_with("udp_url")
 				.takes_value(true)
 				.number_of_values(1)
 				.value_parser(clap::value_parser!(String))
-				.required_unless_present("udp_url"),
-		)
-		.arg(
-			Arg::new("udp_url")
-				.short('w')
-				.long("udp")
-				.help("The UDP URL to connect to")
-				.conflicts_with("ws_url")
-				.takes_value(true)
-				.number_of_values(1)
-				.value_parser(clap::value_parser!(String))
-				.required_unless_present("ws_url"),
+				.required_unless_present(true),
 		)
 		.arg(Arg::new("img_file").help("The path of the image to upload").index(1).required(true))
 		.get_matches();
 
 	// Unwrap is safe as args are guaranteed to exist
-	let ws_url_raw = matches.get_one::<String>("ws_url");
-	let udp_url_raw = matches.get_one::<String>("udp_url");
+	let ws_url = matches.get_one::<String>("ws_url").unwrap();
 
 	let img_file = matches.get_one::<String>("img_file").unwrap();
 	let alpha = matches.get_one::<u8>("alpha");
@@ -368,11 +209,5 @@ fn main() {
 	let repeat = *matches.get_one::<bool>("repeat").unwrap();
 	let shuffle = *matches.get_one::<bool>("shuffle").unwrap();
 
-	let is_ws = udp_url_raw.is_none();
-
-	if is_ws {
-		send_ws(ws_url_raw.unwrap(), img_file, alpha, shuffle, repeat)
-	} else {
-		send_udp(udp_url_raw.unwrap(), img_file, alpha, shuffle, repeat)
-	}
+	send_ws(ws_url, img_file, alpha, shuffle, repeat)
 }
